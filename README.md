@@ -354,41 +354,7 @@ powershell -ExecutionPolicy Bypass -File .\tools\serial_integration_test.ps1 -De
 - `RK3568_上位机接口文档.md`
   - 面向 `RK3568` 程序编写的接口文档
 
-## 12. Git 上传说明
-
-根目录下已提供：
-
-- `.ignore`
-- `.gitignore`
-
-两者使用相同的忽略规则，主要用于过滤以下无关文件：
-
-- `Keil` 构建产物
-- 用户本地调试配置
-- 日志文件
-- 临时文件
-- Python 缓存
-
-如果你要把工程上传到 `GitHub`，建议保留以下内容：
-
-- `Core/`
-- `Drivers/`
-- `Middlewares/`
-- `USB_DEVICE/`
-- `tools/`
-- `MDK-ARM/2Dpan-tilt.uvprojx`
-- `MDK-ARM/RTE/_2Dpan-tilt/RTE_Components.h`
-- `2Dpan-tilt.ioc`
-- 根目录文档
-
-建议忽略以下内容：
-
-- `MDK-ARM/2Dpan-tilt/` 下的构建输出
-- `MDK-ARM/build.log`
-- `MDK-ARM/DebugConfig/`
-- `*.uvoptx`
-
-## 13. 后续建议
+## 
 
 如果后面继续扩展这个工程，推荐优先按以下顺序推进：
 
