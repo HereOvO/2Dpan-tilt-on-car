@@ -14,7 +14,7 @@ extern "C" {
 #define GIMBAL_APP_PROTO_SOF0             0xAAU
 #define GIMBAL_APP_PROTO_SOF1             0x55U
 #define GIMBAL_APP_PROTO_TAIL             0x0DU
-#define GIMBAL_APP_MAX_PAYLOAD_LEN        160U
+#define GIMBAL_APP_MAX_PAYLOAD_LEN        192U
 #define GIMBAL_APP_FRAME_OVERHEAD         13U
 #define GIMBAL_APP_MAX_FRAME_LEN          (GIMBAL_APP_FRAME_OVERHEAD + GIMBAL_APP_MAX_PAYLOAD_LEN)
 #define GIMBAL_APP_RX_FIFO_LEN            512U
@@ -88,7 +88,10 @@ typedef enum
     GIMBAL_APP_PARAM_TARGET_TIMEOUT_MS = 0x21,
     GIMBAL_APP_PARAM_BOOT_CENTER_MS = 0x22,
     GIMBAL_APP_PARAM_KALMAN_Q_MILLI = 0x23,
-    GIMBAL_APP_PARAM_KALMAN_R_MILLI = 0x24
+    GIMBAL_APP_PARAM_KALMAN_R_MILLI = 0x24,
+    GIMBAL_APP_PARAM_PREDICT_ENABLE = 0x25,
+    GIMBAL_APP_PARAM_PREDICT_LEAD_MS = 0x26,
+    GIMBAL_APP_PARAM_PREDICT_VEL_TC_MS = 0x27
 } GimbalAppParamId;
 
 typedef enum
@@ -123,6 +126,9 @@ typedef struct
     uint32_t boot_center_ms;
     uint32_t kalman_q_milli;
     uint32_t kalman_r_milli;
+    uint8_t predict_enable;
+    uint32_t predict_lead_ms;
+    uint32_t predict_vel_tc_ms;
 } GimbalAppParams;
 
 typedef struct

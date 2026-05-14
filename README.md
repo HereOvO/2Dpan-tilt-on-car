@@ -49,6 +49,10 @@
 - 双轴一维 Kalman 观测滤波
   - 在 `TRACK` 有效帧进入控制器前执行
   - `TARGET_INVALID`、目标超时、回中类命令和滤波参数变更时自动复位
+- 纯视觉预测
+  - 基于连续 `TRACK` 的误差变化估计目标误差速度
+  - 在控制周期内用 `PREDICT_LEAD_MS` 做前瞻外推
+  - 预测参数支持在线调试
 - 调试串口日志输出
   - 使用 `USART1`
 - 联调脚本
@@ -179,6 +183,7 @@
 - 异或校验
 - 支持字节流拆包，不依赖 USB 一次回调等于一整帧
 - `PARAM_SET / PARAM_GET` 支持在线调试 Kalman 参数，成功后立即生效
+- `PARAM_SET / PARAM_GET` 支持在线调试预测参数，成功后立即生效
 
 帧格式：
 
@@ -300,6 +305,9 @@ D:\Keil_v5\UV4\UV4.exe -b D:\projects_D\code\嵌赛\2Dpan-tilt\MDK-ARM\2Dpan-til
 - `boot_center_ms = 300`
 - `kalman_q_milli = 16000`
 - `kalman_r_milli = 64000`
+- `predict_enable = 0`
+- `predict_lead_ms = 80`
+- `predict_vel_tc_ms = 120`
 
 ## 10. 调试方法
 
@@ -333,6 +341,7 @@ powershell -ExecutionPolicy Bypass -File .\tools\serial_integration_test.ps1 -De
 - 实际端口号请根据本机枚举结果修改
 - 脚本当前会解析 `ACK.detail` 中的参数记录，并验证 `PARAM_SET -> PARAM_GET` 回读
 - 默认覆盖 `DEADBAND` 与 `KALMAN_Q_MILLI` 两组在线参数测试
+- 当前还会模拟连续 `TRACK`，验证纯视觉预测后的 `STATUS.last_err_x`
 
 ## 11. 文档说明
 

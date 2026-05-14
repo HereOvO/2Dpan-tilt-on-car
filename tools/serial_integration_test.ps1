@@ -7,6 +7,17 @@ param(
 $ErrorActionPreference = "Stop"
 $script:CdcRxBuffer = New-Object System.Collections.Generic.List[byte]
 $script:AckParamValues = @{}
+$script:LatestStatus = @{
+    FrameId = 0
+    State = 0
+    StateName = ""
+    StatusFlags = 0
+    LastTrackFrameId = 0
+    ErrX = 0
+    ErrY = 0
+    PanUs = 0
+    TiltUs = 0
+}
 
 function Write-Log {
     param([string]$Message)
@@ -152,6 +163,9 @@ function Decode-ParamName {
         0x22 { return "BOOT_CENTER_MS" }
         0x23 { return "KALMAN_Q_MILLI" }
         0x24 { return "KALMAN_R_MILLI" }
+        0x25 { return "PREDICT_ENABLE" }
+        0x26 { return "PREDICT_LEAD_MS" }
+        0x27 { return "PREDICT_VEL_TC_MS" }
         default { return ("UNKNOWN_PARAM_0x{0:X2}" -f $ParamId) }
     }
 }
@@ -228,6 +242,32 @@ function Clear-ParamValue {
     }
 }
 
+function Assert-StatusState {
+    param(
+        [string]$ExpectedState,
+        [string]$SourceTag
+    )
+
+    if ($script:LatestStatus.StateName -ne $ExpectedState) {
+        throw "$SourceTag expected state=$ExpectedState but got $($script:LatestStatus.StateName)"
+    }
+
+    Write-Log "$SourceTag verified state=$ExpectedState"
+}
+
+function Assert-StatusErrXAtLeast {
+    param(
+        [int]$MinimumValue,
+        [string]$SourceTag
+    )
+
+    if ([int]$script:LatestStatus.ErrX -lt $MinimumValue) {
+        throw "$SourceTag expected err_x >= $MinimumValue but got $($script:LatestStatus.ErrX)"
+    }
+
+    Write-Log "$SourceTag verified err_x=$($script:LatestStatus.ErrX) >= $MinimumValue"
+}
+
 function Parse-CdcBuffer {
     param([System.Collections.Generic.List[byte]]$Buffer)
 
@@ -279,6 +319,17 @@ function Parse-CdcBuffer {
                 $errY = [BitConverter]::ToInt16($payload, 6)
                 $panUs = [BitConverter]::ToUInt16($payload, 8)
                 $tiltUs = [BitConverter]::ToUInt16($payload, 10)
+                $script:LatestStatus = @{
+                    FrameId = $frameId
+                    State = $payload[0]
+                    StateName = $state
+                    StatusFlags = $statusFlags
+                    LastTrackFrameId = $lastFrameId
+                    ErrX = $errX
+                    ErrY = $errY
+                    PanUs = $panUs
+                    TiltUs = $tiltUs
+                }
                 Write-Log "RX STATUS frame_id=$frameId state=$state flags=0x$($statusFlags.ToString('X2')) last_track=$lastFrameId err=($errX,$errY) pan_us=$panUs tilt_us=$tiltUs"
             }
             0x82 {
@@ -347,6 +398,17 @@ $cdcSerial = $null
 try {
     $script:CdcRxBuffer.Clear()
     $script:AckParamValues.Clear()
+    $script:LatestStatus = @{
+        FrameId = 0
+        State = 0
+        StateName = ""
+        StatusFlags = 0
+        LastTrackFrameId = 0
+        ErrX = 0
+        ErrY = 0
+        PanUs = 0
+        TiltUs = 0
+    }
     $debugSerial = Open-SerialPort -PortName $DebugPort
 
     $debugSerial.DiscardInBuffer()
@@ -410,8 +472,65 @@ try {
     Drain-Ports -DebugPortObj $debugSerial -CdcPortObj $cdcSerial -DurationMs 800
     Assert-ParamValue -ParamId 0x23 -AxisId 0xFF -ExpectedValue 16000 -SourceTag "PARAM_GET_KALMAN_Q"
 
+    $predictSetPayload = New-Object System.Collections.Generic.List[byte]
+    $predictSetPayload.Add(0x25)
+    $predictSetPayload.Add(0xFF)
+    $predictSetPayload.AddRange([BitConverter]::GetBytes([Int32]1))
+    $predictSetPayload.Add(0x26)
+    $predictSetPayload.Add(0xFF)
+    $predictSetPayload.AddRange([BitConverter]::GetBytes([Int32]100))
+    $predictSetPayload.Add(0x27)
+    $predictSetPayload.Add(0xFF)
+    $predictSetPayload.AddRange([BitConverter]::GetBytes([Int32]1))
+    $predictSetPayload.Add(0x0A)
+    $predictSetPayload.Add(0x00)
+    $predictSetPayload.AddRange([BitConverter]::GetBytes([Int32]0))
+    Clear-ParamValue -ParamId 0x25 -AxisId 0xFF
+    Clear-ParamValue -ParamId 0x26 -AxisId 0xFF
+    Clear-ParamValue -ParamId 0x27 -AxisId 0xFF
+    Clear-ParamValue -ParamId 0x0A -AxisId 0x00
+    Send-Frame -Port $cdcSerial -MsgType 0x02 -Flags 0x00 -FrameId 9 -TimestampMs ($tick + 8) -Payload ($predictSetPayload.ToArray()) -Tag "PARAM_SET_PREDICT_PROFILE"
+    Drain-Ports -DebugPortObj $debugSerial -CdcPortObj $cdcSerial -DurationMs 900
+    Assert-ParamValue -ParamId 0x25 -AxisId 0xFF -ExpectedValue 1 -SourceTag "PARAM_SET_PREDICT_PROFILE"
+    Assert-ParamValue -ParamId 0x26 -AxisId 0xFF -ExpectedValue 100 -SourceTag "PARAM_SET_PREDICT_PROFILE"
+    Assert-ParamValue -ParamId 0x27 -AxisId 0xFF -ExpectedValue 1 -SourceTag "PARAM_SET_PREDICT_PROFILE"
+    Assert-ParamValue -ParamId 0x0A -AxisId 0x00 -ExpectedValue 0 -SourceTag "PARAM_SET_PREDICT_PROFILE"
+
+    $predictGetPayload = New-Object System.Collections.Generic.List[byte]
+    $predictGetPayload.AddRange([byte[]]@(0x25, 0xFF, 0x26, 0xFF, 0x27, 0xFF, 0x0A, 0x00))
+    Clear-ParamValue -ParamId 0x25 -AxisId 0xFF
+    Clear-ParamValue -ParamId 0x26 -AxisId 0xFF
+    Clear-ParamValue -ParamId 0x27 -AxisId 0xFF
+    Clear-ParamValue -ParamId 0x0A -AxisId 0x00
+    Send-Frame -Port $cdcSerial -MsgType 0x03 -Flags 0x00 -FrameId 10 -TimestampMs ($tick + 9) -Payload ($predictGetPayload.ToArray()) -Tag "PARAM_GET_PREDICT_PROFILE"
+    Drain-Ports -DebugPortObj $debugSerial -CdcPortObj $cdcSerial -DurationMs 900
+    Assert-ParamValue -ParamId 0x25 -AxisId 0xFF -ExpectedValue 1 -SourceTag "PARAM_GET_PREDICT_PROFILE"
+    Assert-ParamValue -ParamId 0x26 -AxisId 0xFF -ExpectedValue 100 -SourceTag "PARAM_GET_PREDICT_PROFILE"
+    Assert-ParamValue -ParamId 0x27 -AxisId 0xFF -ExpectedValue 1 -SourceTag "PARAM_GET_PREDICT_PROFILE"
+    Assert-ParamValue -ParamId 0x0A -AxisId 0x00 -ExpectedValue 0 -SourceTag "PARAM_GET_PREDICT_PROFILE"
+
+    $track0Payload = New-Object System.Collections.Generic.List[byte]
+    $track0Payload.AddRange([BitConverter]::GetBytes([Int16]0))
+    $track0Payload.AddRange([BitConverter]::GetBytes([Int16]0))
+    Send-Frame -Port $cdcSerial -MsgType 0x01 -Flags 0x07 -FrameId 11 -TimestampMs 1000 -Payload ($track0Payload.ToArray()) -Tag "TRACK_PRED_0"
+    Drain-Ports -DebugPortObj $debugSerial -CdcPortObj $cdcSerial -DurationMs 220
+
+    $track1Payload = New-Object System.Collections.Generic.List[byte]
+    $track1Payload.AddRange([BitConverter]::GetBytes([Int16]100))
+    $track1Payload.AddRange([BitConverter]::GetBytes([Int16]0))
+    Send-Frame -Port $cdcSerial -MsgType 0x01 -Flags 0x07 -FrameId 12 -TimestampMs 1100 -Payload ($track1Payload.ToArray()) -Tag "TRACK_PRED_100"
+    Drain-Ports -DebugPortObj $debugSerial -CdcPortObj $cdcSerial -DurationMs 220
+
+    $track2Payload = New-Object System.Collections.Generic.List[byte]
+    $track2Payload.AddRange([BitConverter]::GetBytes([Int16]200))
+    $track2Payload.AddRange([BitConverter]::GetBytes([Int16]0))
+    Send-Frame -Port $cdcSerial -MsgType 0x01 -Flags 0x07 -FrameId 13 -TimestampMs 1200 -Payload ($track2Payload.ToArray()) -Tag "TRACK_PRED_200"
+    Drain-Ports -DebugPortObj $debugSerial -CdcPortObj $cdcSerial -DurationMs 260
+    Assert-StatusState -ExpectedState "TRACKING" -SourceTag "PREDICT_STATUS"
+    Assert-StatusErrXAtLeast -MinimumValue 240 -SourceTag "PREDICT_STATUS"
+
     $goHomePayload = [byte[]]@(0x01)
-    Send-Frame -Port $cdcSerial -MsgType 0x04 -Flags 0x00 -FrameId 9 -TimestampMs ($tick + 8) -Payload $goHomePayload -Tag "GO_HOME"
+    Send-Frame -Port $cdcSerial -MsgType 0x04 -Flags 0x00 -FrameId 14 -TimestampMs ($tick + 10) -Payload $goHomePayload -Tag "GO_HOME"
     Drain-Ports -DebugPortObj $debugSerial -CdcPortObj $cdcSerial -DurationMs 1000
 
     Write-Log "Integration test sequence finished"

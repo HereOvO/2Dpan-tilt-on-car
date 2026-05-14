@@ -47,6 +47,9 @@ typedef struct
 } GimbalPendingAck;
 
 #define GIMBAL_APP_ACK_QUEUE_LEN 8U
+#define GIMBAL_APP_PREDICT_DT_MAX_MS 500U
+#define GIMBAL_APP_PREDICT_HORIZON_MAX_MS 250U
+#define GIMBAL_APP_PREDICT_VEL_ABS_MAX_ERR_PER_S 12000.0f
 
 typedef struct
 {
@@ -63,6 +66,7 @@ typedef struct
     GimbalAckQueue ack_queue;
     GimbalAppTrackSample latest_track;
     GimbalAppState state;
+    int16_t control_err[GIMBAL_APP_AXIS_COUNT];
     uint16_t output_us[GIMBAL_APP_AXIS_COUNT];
     uint16_t output_compare[GIMBAL_APP_AXIS_COUNT];
     uint32_t boot_center_until_ms;
@@ -84,10 +88,20 @@ typedef struct
     float covariance;
 } GimbalAxisKalmanState;
 
+typedef struct
+{
+    bool initialized;
+    float last_measurement;
+    float velocity_err_per_s;
+    uint32_t last_capture_ts_ms;
+    uint32_t last_rx_tick_ms;
+} GimbalAxisPredictState;
+
 extern TIM_HandleTypeDef htim1;
 
 static GimbalAppContext g_gimbal;
 static GimbalAxisKalmanState g_kalman[GIMBAL_APP_AXIS_COUNT];
+static GimbalAxisPredictState g_predictor[GIMBAL_APP_AXIS_COUNT];
 
 static uint32_t GimbalApp_GetNowMs(void);
 static void GimbalApp_LoadDefaultParams(GimbalAppParams *params);
@@ -118,9 +132,14 @@ static int16_t GimbalApp_ReadLe16s(const uint8_t *src);
 static uint16_t GimbalApp_AbsI16(int16_t value);
 static float GimbalApp_ParamMilliToFloat(uint32_t value_milli);
 static int16_t GimbalApp_FloatToI16(float value);
+static float GimbalApp_ClampFloat(float value, float min_value, float max_value);
+static uint32_t GimbalApp_ResolveTrackDtMs(const GimbalAxisPredictState *axis_state, uint32_t capture_ts_ms, uint32_t rx_tick_ms);
 static void GimbalApp_ResetKalmanFilters(void);
-static bool GimbalApp_DidKalmanConfigChange(const GimbalAppParams *lhs, const GimbalAppParams *rhs);
+static void GimbalApp_ResetPredictorStates(void);
+static bool GimbalApp_DidObserverConfigChange(const GimbalAppParams *lhs, const GimbalAppParams *rhs);
 static int16_t GimbalApp_ApplyKalman(uint8_t axis_index, int16_t measurement);
+static void GimbalApp_UpdatePredictor(uint8_t axis_index, int16_t measurement, uint32_t capture_ts_ms, uint32_t rx_tick_ms);
+static int16_t GimbalApp_GetControlErrorForAxis(uint8_t axis_index, uint32_t now_ms);
 static void GimbalApp_ConfigureServoTimer(void);
 static void GimbalApp_ProcessQueuedRx(void);
 static bool GimbalApp_RxFifoPush(uint8_t byte);
@@ -132,6 +151,7 @@ void GimbalApp_Init(void)
 {
     memset(&g_gimbal, 0, sizeof(g_gimbal));
     memset(g_kalman, 0, sizeof(g_kalman));
+    memset(g_predictor, 0, sizeof(g_predictor));
 
     GimbalApp_ConfigureServoTimer();
     GimbalApp_LoadDefaultParams(&g_gimbal.params);
@@ -350,7 +370,7 @@ void GimbalApp_ControlTick100Hz(void)
 
         if (age_ms > g_gimbal.params.target_timeout_ms)
         {
-            g_gimbal.latest_track.valid = false;
+            GimbalApp_ClearTargetValidity();
             if (g_gimbal.target_was_seen)
             {
                 GimbalApp_SetState(GIMBAL_APP_STATE_HOLD_LAST);
@@ -365,9 +385,11 @@ void GimbalApp_ControlTick100Hz(void)
         for (axis_index = 0U; axis_index < GIMBAL_APP_AXIS_COUNT; ++axis_index)
         {
             const GimbalAppAxisParams *axis = &g_gimbal.params.axis[axis_index];
-            int16_t raw_err = (axis_index == GIMBAL_APP_AXIS_PAN) ? g_gimbal.latest_track.err_x : g_gimbal.latest_track.err_y;
+            int16_t raw_err = GimbalApp_GetControlErrorForAxis(axis_index, now_ms);
             int32_t effective_err = raw_err;
             int32_t delta_us;
+
+            g_gimbal.control_err[axis_index] = raw_err;
 
             if (GimbalApp_AbsI16(raw_err) <= axis->deadband)
             {
@@ -399,7 +421,14 @@ void GimbalApp_ControlTick100Hz(void)
     }
     else if (g_gimbal.state == GIMBAL_APP_STATE_STANDBY)
     {
+        g_gimbal.control_err[GIMBAL_APP_AXIS_PAN] = 0;
+        g_gimbal.control_err[GIMBAL_APP_AXIS_TILT] = 0;
         GimbalApp_SetOutputsToHome();
+    }
+    else
+    {
+        g_gimbal.control_err[GIMBAL_APP_AXIS_PAN] = 0;
+        g_gimbal.control_err[GIMBAL_APP_AXIS_TILT] = 0;
     }
 
     if ((g_gimbal.params.status_period_ms > 0U) &&
@@ -458,12 +487,12 @@ void GimbalApp_GetLatestErrors(int16_t *err_x, int16_t *err_y)
 {
     if (err_x != NULL)
     {
-        *err_x = g_gimbal.latest_track.err_x;
+        *err_x = g_gimbal.control_err[GIMBAL_APP_AXIS_PAN];
     }
 
     if (err_y != NULL)
     {
-        *err_y = g_gimbal.latest_track.err_y;
+        *err_y = g_gimbal.control_err[GIMBAL_APP_AXIS_TILT];
     }
 }
 
@@ -521,8 +550,8 @@ void GimbalApp_GetStatusSnapshot(GimbalAppStatusSnapshot *out_status)
     out_status->last_track_rx_ms = g_gimbal.latest_track.rx_tick_ms;
     out_status->status_period_ms = g_gimbal.params.status_period_ms;
     out_status->target_timeout_ms = g_gimbal.params.target_timeout_ms;
-    out_status->last_err_x = g_gimbal.latest_track.err_x;
-    out_status->last_err_y = g_gimbal.latest_track.err_y;
+    out_status->last_err_x = g_gimbal.control_err[GIMBAL_APP_AXIS_PAN];
+    out_status->last_err_y = g_gimbal.control_err[GIMBAL_APP_AXIS_TILT];
     out_status->status_flags = GimbalApp_MakeStatusFlags();
     out_status->pending_status = g_gimbal.pending_status;
     out_status->pending_ack = (g_gimbal.ack_queue.count > 0U);
@@ -556,8 +585,8 @@ uint16_t GimbalApp_BuildStatusFrame(uint8_t *out_buf, uint16_t buf_size)
     payload[0] = (uint8_t)g_gimbal.state;
     payload[1] = GimbalApp_MakeStatusFlags();
     GimbalApp_WriteLe16(&payload[2], g_gimbal.latest_track.frame_id);
-    GimbalApp_WriteLe16(&payload[4], (uint16_t)g_gimbal.latest_track.err_x);
-    GimbalApp_WriteLe16(&payload[6], (uint16_t)g_gimbal.latest_track.err_y);
+    GimbalApp_WriteLe16(&payload[4], (uint16_t)g_gimbal.control_err[GIMBAL_APP_AXIS_PAN]);
+    GimbalApp_WriteLe16(&payload[6], (uint16_t)g_gimbal.control_err[GIMBAL_APP_AXIS_TILT]);
     GimbalApp_WriteLe16(&payload[8], g_gimbal.output_us[GIMBAL_APP_AXIS_PAN]);
     GimbalApp_WriteLe16(&payload[10], g_gimbal.output_us[GIMBAL_APP_AXIS_TILT]);
     GimbalApp_WriteLe16(&payload[12], g_gimbal.output_compare[GIMBAL_APP_AXIS_PAN]);
@@ -672,6 +701,9 @@ static void GimbalApp_LoadDefaultParams(GimbalAppParams *params)
     params->boot_center_ms = 300U;
     params->kalman_q_milli = 16000U;
     params->kalman_r_milli = 64000U;
+    params->predict_enable = 0U;
+    params->predict_lead_ms = 80U;
+    params->predict_vel_tc_ms = 120U;
 }
 
 static void GimbalApp_SanitizeParams(GimbalAppParams *params)
@@ -729,6 +761,8 @@ static void GimbalApp_SanitizeParams(GimbalAppParams *params)
     {
         params->kalman_r_milli = 1U;
     }
+
+    params->predict_enable = (params->predict_enable != 0U) ? 1U : 0U;
 }
 
 static uint16_t GimbalApp_ClampAxisUs(const GimbalAppAxisParams *axis, int32_t value_us)
@@ -880,7 +914,10 @@ static void GimbalApp_RequestStatus(void)
 static void GimbalApp_ClearTargetValidity(void)
 {
     g_gimbal.latest_track.valid = false;
+    g_gimbal.control_err[GIMBAL_APP_AXIS_PAN] = 0;
+    g_gimbal.control_err[GIMBAL_APP_AXIS_TILT] = 0;
     GimbalApp_ResetKalmanFilters();
+    GimbalApp_ResetPredictorStates();
 }
 
 static bool GimbalApp_HandleTrackFrame(uint16_t frame_id, uint32_t capture_ts_ms, uint8_t flags, const uint8_t *payload, uint8_t payload_len)
@@ -908,6 +945,8 @@ static bool GimbalApp_HandleTrackFrame(uint16_t frame_id, uint32_t capture_ts_ms
     {
         g_gimbal.latest_track.err_x = GimbalApp_ApplyKalman(GIMBAL_APP_AXIS_PAN, raw_err_x);
         g_gimbal.latest_track.err_y = GimbalApp_ApplyKalman(GIMBAL_APP_AXIS_TILT, raw_err_y);
+        GimbalApp_UpdatePredictor(GIMBAL_APP_AXIS_PAN, g_gimbal.latest_track.err_x, capture_ts_ms, now_ms);
+        GimbalApp_UpdatePredictor(GIMBAL_APP_AXIS_TILT, g_gimbal.latest_track.err_y, capture_ts_ms, now_ms);
         g_gimbal.latest_track.valid = true;
         if (g_gimbal.state != GIMBAL_APP_STATE_BOOT_CENTERING)
         {
@@ -916,9 +955,12 @@ static bool GimbalApp_HandleTrackFrame(uint16_t frame_id, uint32_t capture_ts_ms
     }
     else
     {
-        GimbalApp_ResetKalmanFilters();
         g_gimbal.latest_track.err_x = raw_err_x;
         g_gimbal.latest_track.err_y = raw_err_y;
+        g_gimbal.control_err[GIMBAL_APP_AXIS_PAN] = raw_err_x;
+        g_gimbal.control_err[GIMBAL_APP_AXIS_TILT] = raw_err_y;
+        GimbalApp_ResetKalmanFilters();
+        GimbalApp_ResetPredictorStates();
         g_gimbal.latest_track.valid = false;
         if (g_gimbal.state != GIMBAL_APP_STATE_BOOT_CENTERING)
         {
@@ -932,7 +974,7 @@ static bool GimbalApp_HandleTrackFrame(uint16_t frame_id, uint32_t capture_ts_ms
 static void GimbalApp_HandleParamSet(uint8_t msg_type, uint16_t frame_id, const uint8_t *payload, uint8_t payload_len)
 {
     GimbalAppParams new_params;
-    bool kalman_config_changed;
+    bool observer_config_changed;
     uint8_t detail[GIMBAL_APP_MAX_PAYLOAD_LEN - 2U];
     uint8_t offset = 0U;
     uint8_t index;
@@ -959,12 +1001,13 @@ static void GimbalApp_HandleParamSet(uint8_t msg_type, uint16_t frame_id, const 
     }
 
     GimbalApp_SanitizeParams(&new_params);
-    kalman_config_changed = GimbalApp_DidKalmanConfigChange(&g_gimbal.params, &new_params);
+    observer_config_changed = GimbalApp_DidObserverConfigChange(&g_gimbal.params, &new_params);
     g_gimbal.params = new_params;
 
-    if (kalman_config_changed)
+    if (observer_config_changed)
     {
         GimbalApp_ResetKalmanFilters();
+        GimbalApp_ResetPredictorStates();
     }
 
     if ((g_gimbal.state == GIMBAL_APP_STATE_STANDBY) || (g_gimbal.state == GIMBAL_APP_STATE_BOOT_CENTERING))
@@ -1062,7 +1105,10 @@ static void GimbalApp_HandleParamGet(uint8_t msg_type, uint16_t frame_id, const 
         { GIMBAL_APP_PARAM_TARGET_TIMEOUT_MS, GIMBAL_APP_AXIS_ALL },
         { GIMBAL_APP_PARAM_BOOT_CENTER_MS, GIMBAL_APP_AXIS_ALL },
         { GIMBAL_APP_PARAM_KALMAN_Q_MILLI, GIMBAL_APP_AXIS_ALL },
-        { GIMBAL_APP_PARAM_KALMAN_R_MILLI, GIMBAL_APP_AXIS_ALL }
+        { GIMBAL_APP_PARAM_KALMAN_R_MILLI, GIMBAL_APP_AXIS_ALL },
+        { GIMBAL_APP_PARAM_PREDICT_ENABLE, GIMBAL_APP_AXIS_ALL },
+        { GIMBAL_APP_PARAM_PREDICT_LEAD_MS, GIMBAL_APP_AXIS_ALL },
+        { GIMBAL_APP_PARAM_PREDICT_VEL_TC_MS, GIMBAL_APP_AXIS_ALL }
     };
 
     if ((payload_len % 2U) != 0U)
@@ -1349,7 +1395,10 @@ static bool GimbalApp_TrySetParam(GimbalAppParams *params, uint8_t param_id, uin
         (param_id != GIMBAL_APP_PARAM_TARGET_TIMEOUT_MS) &&
         (param_id != GIMBAL_APP_PARAM_BOOT_CENTER_MS) &&
         (param_id != GIMBAL_APP_PARAM_KALMAN_Q_MILLI) &&
-        (param_id != GIMBAL_APP_PARAM_KALMAN_R_MILLI))
+        (param_id != GIMBAL_APP_PARAM_KALMAN_R_MILLI) &&
+        (param_id != GIMBAL_APP_PARAM_PREDICT_ENABLE) &&
+        (param_id != GIMBAL_APP_PARAM_PREDICT_LEAD_MS) &&
+        (param_id != GIMBAL_APP_PARAM_PREDICT_VEL_TC_MS))
     {
         axis_start = 0U;
         axis_end = GIMBAL_APP_AXIS_COUNT;
@@ -1421,6 +1470,30 @@ static bool GimbalApp_TrySetParam(GimbalAppParams *params, uint8_t param_id, uin
             return false;
         }
         params->kalman_r_milli = (uint32_t)value;
+        return true;
+
+    case GIMBAL_APP_PARAM_PREDICT_ENABLE:
+        if ((value != 0) && (value != 1))
+        {
+            return false;
+        }
+        params->predict_enable = (uint8_t)value;
+        return true;
+
+    case GIMBAL_APP_PARAM_PREDICT_LEAD_MS:
+        if (value < 0)
+        {
+            return false;
+        }
+        params->predict_lead_ms = (uint32_t)value;
+        return true;
+
+    case GIMBAL_APP_PARAM_PREDICT_VEL_TC_MS:
+        if (value < 0)
+        {
+            return false;
+        }
+        params->predict_vel_tc_ms = (uint32_t)value;
         return true;
 
     default:
@@ -1554,6 +1627,18 @@ static bool GimbalApp_TryReadParam(const GimbalAppParams *params, uint8_t param_
 
     case GIMBAL_APP_PARAM_KALMAN_R_MILLI:
         *value_out = (int32_t)params->kalman_r_milli;
+        return true;
+
+    case GIMBAL_APP_PARAM_PREDICT_ENABLE:
+        *value_out = params->predict_enable;
+        return true;
+
+    case GIMBAL_APP_PARAM_PREDICT_LEAD_MS:
+        *value_out = (int32_t)params->predict_lead_ms;
+        return true;
+
+    case GIMBAL_APP_PARAM_PREDICT_VEL_TC_MS:
+        *value_out = (int32_t)params->predict_vel_tc_ms;
         return true;
 
     default:
@@ -1691,12 +1776,57 @@ static int16_t GimbalApp_FloatToI16(float value)
     return (int16_t)rounded;
 }
 
+static float GimbalApp_ClampFloat(float value, float min_value, float max_value)
+{
+    if (value < min_value)
+    {
+        return min_value;
+    }
+
+    if (value > max_value)
+    {
+        return max_value;
+    }
+
+    return value;
+}
+
+static uint32_t GimbalApp_ResolveTrackDtMs(const GimbalAxisPredictState *axis_state, uint32_t capture_ts_ms, uint32_t rx_tick_ms)
+{
+    uint32_t capture_dt_ms;
+    uint32_t rx_dt_ms;
+
+    if ((axis_state == NULL) || (!axis_state->initialized))
+    {
+        return 0U;
+    }
+
+    capture_dt_ms = capture_ts_ms - axis_state->last_capture_ts_ms;
+    if ((capture_dt_ms > 0U) && (capture_dt_ms <= GIMBAL_APP_PREDICT_DT_MAX_MS))
+    {
+        return capture_dt_ms;
+    }
+
+    rx_dt_ms = rx_tick_ms - axis_state->last_rx_tick_ms;
+    if ((rx_dt_ms > 0U) && (rx_dt_ms <= GIMBAL_APP_PREDICT_DT_MAX_MS))
+    {
+        return rx_dt_ms;
+    }
+
+    return 0U;
+}
+
 static void GimbalApp_ResetKalmanFilters(void)
 {
     memset(g_kalman, 0, sizeof(g_kalman));
 }
 
-static bool GimbalApp_DidKalmanConfigChange(const GimbalAppParams *lhs, const GimbalAppParams *rhs)
+static void GimbalApp_ResetPredictorStates(void)
+{
+    memset(g_predictor, 0, sizeof(g_predictor));
+}
+
+static bool GimbalApp_DidObserverConfigChange(const GimbalAppParams *lhs, const GimbalAppParams *rhs)
 {
     uint8_t axis_index;
 
@@ -1706,7 +1836,10 @@ static bool GimbalApp_DidKalmanConfigChange(const GimbalAppParams *lhs, const Gi
     }
 
     if ((lhs->kalman_q_milli != rhs->kalman_q_milli) ||
-        (lhs->kalman_r_milli != rhs->kalman_r_milli))
+        (lhs->kalman_r_milli != rhs->kalman_r_milli) ||
+        (lhs->predict_enable != rhs->predict_enable) ||
+        (lhs->predict_lead_ms != rhs->predict_lead_ms) ||
+        (lhs->predict_vel_tc_ms != rhs->predict_vel_tc_ms))
     {
         return true;
     }
@@ -1758,6 +1891,96 @@ static int16_t GimbalApp_ApplyKalman(uint8_t axis_index, int16_t measurement)
     axis_state->covariance = (1.0f - kalman_gain) * predicted_covariance;
 
     return GimbalApp_FloatToI16(axis_state->estimate);
+}
+
+static void GimbalApp_UpdatePredictor(uint8_t axis_index, int16_t measurement, uint32_t capture_ts_ms, uint32_t rx_tick_ms)
+{
+    GimbalAxisPredictState *axis_state;
+    uint32_t dt_ms;
+    float raw_velocity;
+    float alpha;
+    float vel_tc_ms;
+    float measurement_value;
+
+    if (axis_index >= GIMBAL_APP_AXIS_COUNT)
+    {
+        return;
+    }
+
+    axis_state = &g_predictor[axis_index];
+    measurement_value = (float)measurement;
+
+    if (!axis_state->initialized)
+    {
+        axis_state->initialized = true;
+        axis_state->last_measurement = measurement_value;
+        axis_state->velocity_err_per_s = 0.0f;
+        axis_state->last_capture_ts_ms = capture_ts_ms;
+        axis_state->last_rx_tick_ms = rx_tick_ms;
+        return;
+    }
+
+    dt_ms = GimbalApp_ResolveTrackDtMs(axis_state, capture_ts_ms, rx_tick_ms);
+    if (dt_ms > 0U)
+    {
+        raw_velocity = (measurement_value - axis_state->last_measurement) * 1000.0f / (float)dt_ms;
+        raw_velocity = GimbalApp_ClampFloat(
+            raw_velocity,
+            -GIMBAL_APP_PREDICT_VEL_ABS_MAX_ERR_PER_S,
+            GIMBAL_APP_PREDICT_VEL_ABS_MAX_ERR_PER_S);
+
+        vel_tc_ms = (float)g_gimbal.params.predict_vel_tc_ms;
+        if (vel_tc_ms <= 0.0f)
+        {
+            alpha = 1.0f;
+        }
+        else
+        {
+            alpha = ((float)dt_ms) / (vel_tc_ms + (float)dt_ms);
+        }
+
+        axis_state->velocity_err_per_s += alpha * (raw_velocity - axis_state->velocity_err_per_s);
+    }
+
+    axis_state->last_measurement = measurement_value;
+    axis_state->last_capture_ts_ms = capture_ts_ms;
+    axis_state->last_rx_tick_ms = rx_tick_ms;
+}
+
+static int16_t GimbalApp_GetControlErrorForAxis(uint8_t axis_index, uint32_t now_ms)
+{
+    const GimbalAxisPredictState *axis_state;
+    int16_t base_err;
+    uint32_t horizon_ms;
+    float predicted_err;
+
+    if (axis_index >= GIMBAL_APP_AXIS_COUNT)
+    {
+        return 0;
+    }
+
+    base_err = (axis_index == GIMBAL_APP_AXIS_PAN) ? g_gimbal.latest_track.err_x : g_gimbal.latest_track.err_y;
+
+    if ((g_gimbal.params.predict_enable == 0U) || (!g_gimbal.latest_track.valid))
+    {
+        return base_err;
+    }
+
+    axis_state = &g_predictor[axis_index];
+    if (!axis_state->initialized)
+    {
+        return base_err;
+    }
+
+    horizon_ms = now_ms - g_gimbal.latest_track.rx_tick_ms;
+    horizon_ms += g_gimbal.params.predict_lead_ms;
+    if (horizon_ms > GIMBAL_APP_PREDICT_HORIZON_MAX_MS)
+    {
+        horizon_ms = GIMBAL_APP_PREDICT_HORIZON_MAX_MS;
+    }
+
+    predicted_err = (float)base_err + (axis_state->velocity_err_per_s * ((float)horizon_ms / 1000.0f));
+    return GimbalApp_FloatToI16(predicted_err);
 }
 
 static void GimbalApp_ProcessQueuedRx(void)

@@ -10,6 +10,7 @@
 - 当前已实现：
   - 跟踪误差输入
   - 双轴一维 Kalman 观测滤波
+  - 纯视觉预测
   - 参数在线读写
   - 控制命令
   - 状态回传
@@ -84,15 +85,15 @@
 | `payload_len` | 1 | `uint8` | 负载长度 |
 | `frame_id` | 2 | `uint16_le` | 帧序号 |
 | `capture_ts_ms` | 4 | `uint32_le` | 图像采集时刻，单位 ms |
-| `payload` | N | bytes | 最大 `160` 字节 |
+| `payload` | N | bytes | 最大 `192` 字节 |
 | `checksum` | 1 | XOR | 从 `msg_type` 到 `payload` 的逐字节异或 |
 | `tail` | 1 | 固定值 | `0x0D` |
 
 ### 3.3 长度限制
 
-- 最大 payload：`160` 字节
+- 最大 payload：`192` 字节
 - 固定开销：`13` 字节
-- 最大整帧：`173` 字节
+- 最大整帧：`205` 字节
 
 ### 3.4 字节序与校验
 
@@ -147,6 +148,7 @@ payload 固定 4 字节：
 
 - `payload_len` 必须等于 `4`
 - 原始 `err_x / err_y` 在 STM32 侧先进入 Kalman 观测滤波，再进入控制器
+- 若启用了纯视觉预测，STM32 会根据连续 `TRACK` 的误差变化估计速度，并在控制环内做前瞻外推
 - `TARGET_VALID=1`：更新目标并切到 `TRACKING`
 - `TARGET_VALID=0`：目标无效，切到 `HOLD_LAST`
 - 如果请求了 `ACK_REQUEST`，合法帧回 `ACK OK`
@@ -176,6 +178,7 @@ payload 按 6 字节一组：
 - 成功时 ACK detail 返回“实际生效值”
 - 对全局参数，ACK detail 中的 `axis_id` 统一回 `0xFF`
 - 若修改了 `KALMAN_ENABLE / KALMAN_Q_MILLI / KALMAN_R_MILLI`，滤波内部状态会立即复位
+- 若修改了 `PREDICT_ENABLE / PREDICT_LEAD_MS / PREDICT_VEL_TC_MS`，预测内部状态也会立即复位
 
 ### 6.3 PARAM_GET (`0x03`)
 
@@ -249,6 +252,7 @@ payload 固定 32 字节：
 
 - `STATUS` 帧自己的 `frame_id` 是 STM32 自增发送序号，不等于最近一次 TRACK 的 `frame_id`
 - `last_err_x / last_err_y` 表示 STM32 当前用于控制的最近误差
+  - 启用预测时，这里是“预测后”的控制误差
   - 对应轴 `KALMAN_ENABLE=1` 时，这里是滤波后的误差
   - 对应轴 `KALMAN_ENABLE=0` 时，这里是原始误差
 
@@ -310,6 +314,11 @@ payload：
   - `TRACKING` 状态下目标超时
   - `GO_HOME` / `SET_STANDBY` / `CLEAR_TARGET` / `SET_STATE(STANDBY)`
   - 在线修改 `KALMAN_ENABLE / KALMAN_Q_MILLI / KALMAN_R_MILLI`
+- 以下情况也会复位纯视觉预测内部状态：
+  - 收到 `TARGET_VALID=0` 的 TRACK
+  - `TRACKING` 状态下目标超时
+  - `GO_HOME` / `SET_STANDBY` / `CLEAR_TARGET` / `SET_STATE(STANDBY)`
+  - 在线修改 `PREDICT_ENABLE / PREDICT_LEAD_MS / PREDICT_VEL_TC_MS`
 
 ## 8. 控制算法
 
@@ -323,6 +332,11 @@ payload：
   - 当前使用随机游走模型：`P_pred = P_prev + Q`，`K = P_pred / (P_pred + R)`
   - `KALMAN_ENABLE=0` 时，该轴直接旁路原始误差
   - `Q / R` 通过 `PARAM_SET` 在线调整，内部按 `value / 1000.0` 解释为浮点量
+- 纯视觉预测：
+  - 预测器不使用 IMU，只使用连续 `TRACK` 的误差变化
+  - 帧间速度优先由 `capture_ts_ms` 的相邻差值估计；若该差值异常，则回退到 STM32 本地接收间隔
+  - 控制环使用 `predict_lead_ms` 做固定前瞻，并叠加 STM32 收到该帧后的本地等待时间
+  - `predict_vel_tc_ms` 用于平滑速度估计，数值越小，速度跟随越快
 - 死区：
   - `abs(err) <= deadband` 时按 `0` 处理
 - 增量：
@@ -361,6 +375,9 @@ payload：
 | `0x22` | `BOOT_CENTER_MS` | `0xFF` | 上电归中保持时间 |
 | `0x23` | `KALMAN_Q_MILLI` | `0xFF` | Kalman 过程噪声参数，内部按 `value / 1000.0` 使用 |
 | `0x24` | `KALMAN_R_MILLI` | `0xFF` | Kalman 观测噪声参数，内部按 `value / 1000.0` 使用 |
+| `0x25` | `PREDICT_ENABLE` | `0xFF` | 0 关闭纯视觉预测，1 开启 |
+| `0x26` | `PREDICT_LEAD_MS` | `0xFF` | 预测前瞻时间，单位 ms |
+| `0x27` | `PREDICT_VEL_TC_MS` | `0xFF` | 速度估计平滑时间常数，单位 ms |
 
 ### 9.3 axis_id
 
@@ -392,6 +409,9 @@ payload：
 - `boot_center_ms = 300`
 - `kalman_q_milli = 16000`
 - `kalman_r_milli = 64000`
+- `predict_enable = 0`
+- `predict_lead_ms = 80`
+- `predict_vel_tc_ms = 120`
 
 ### 9.5 参数整理规则
 
@@ -405,6 +425,9 @@ payload：
 - `kalman_enable` 只允许 `0/1`
 - `kalman_q_milli` 允许 `0` 及以上
 - `kalman_r_milli` 最小为 `1`
+- `predict_enable` 只允许 `0/1`
+- `predict_lead_ms` 允许 `0` 及以上
+- `predict_vel_tc_ms` 允许 `0` 及以上；`0` 表示速度估计不再额外平滑
 - 当前默认机械定义：
   - 水平轴 `PAN.home_us = 1500 us` 保持不变
   - 竖直轴 `TILT.home_us = 501 us` 定义为“正前方回中”
@@ -427,6 +450,10 @@ payload：
   - 数值越大，误差跟随越快，平滑性越弱
 - 调 `KALMAN_R_MILLI` 时：
   - 数值越大，误差更平滑，但响应更慢
+- 调 `PREDICT_LEAD_MS` 时：
+  - 数值越大，前瞻越强，但更容易过冲
+- 调 `PREDICT_VEL_TC_MS` 时：
+  - 数值越小，速度估计越灵敏；数值越大，速度估计越稳
 
 ## 11. 推荐联调顺序
 
@@ -435,8 +462,8 @@ payload：
 3. 校验 `STATUS` 中的当前状态、输出脉宽和参数
 4. 发送一帧 `TARGET_VALID=1` 的 TRACK，观察是否进入 `TRACKING`
 5. 再发送 `TARGET_VALID=0` 的 TRACK，观察是否进入 `HOLD_LAST`
-6. 用 `PARAM_GET` 读取 `KALMAN_ENABLE / KALMAN_Q_MILLI / KALMAN_R_MILLI`
-7. 用 `PARAM_SET` 调 `kp`、`deadband`、`max_step_us`、`KALMAN_Q_MILLI / KALMAN_R_MILLI`
+6. 用 `PARAM_GET` 读取 `KALMAN_ENABLE / KALMAN_Q_MILLI / KALMAN_R_MILLI / PREDICT_*`
+7. 用 `PARAM_SET` 调 `kp`、`deadband`、`max_step_us`、`KALMAN_* / PREDICT_*`
 8. 解析 `ACK.detail`，确认返回值已经生效
 
 ## 12. 建议的 TRACK 误差定义
