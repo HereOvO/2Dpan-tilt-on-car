@@ -83,9 +83,12 @@ typedef enum
     GIMBAL_APP_PARAM_MIN_US = 0x07,
     GIMBAL_APP_PARAM_MAX_US = 0x08,
     GIMBAL_APP_PARAM_INVERT = 0x09,
+    GIMBAL_APP_PARAM_KALMAN_ENABLE = 0x0A,
     GIMBAL_APP_PARAM_STATUS_PERIOD_MS = 0x20,
     GIMBAL_APP_PARAM_TARGET_TIMEOUT_MS = 0x21,
-    GIMBAL_APP_PARAM_BOOT_CENTER_MS = 0x22
+    GIMBAL_APP_PARAM_BOOT_CENTER_MS = 0x22,
+    GIMBAL_APP_PARAM_KALMAN_Q_MILLI = 0x23,
+    GIMBAL_APP_PARAM_KALMAN_R_MILLI = 0x24
 } GimbalAppParamId;
 
 typedef enum
@@ -109,6 +112,7 @@ typedef struct
     uint16_t min_us;
     uint16_t max_us;
     uint8_t invert;
+    uint8_t kalman_enable;
 } GimbalAppAxisParams;
 
 typedef struct
@@ -117,6 +121,8 @@ typedef struct
     uint32_t status_period_ms;
     uint32_t target_timeout_ms;
     uint32_t boot_center_ms;
+    uint32_t kalman_q_milli;
+    uint32_t kalman_r_milli;
 } GimbalAppParams;
 
 typedef struct

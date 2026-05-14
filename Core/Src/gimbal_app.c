@@ -77,9 +77,17 @@ typedef struct
     uint8_t rx_fifo[GIMBAL_APP_RX_FIFO_LEN];
 } GimbalAppContext;
 
+typedef struct
+{
+    bool initialized;
+    float estimate;
+    float covariance;
+} GimbalAxisKalmanState;
+
 extern TIM_HandleTypeDef htim1;
 
 static GimbalAppContext g_gimbal;
+static GimbalAxisKalmanState g_kalman[GIMBAL_APP_AXIS_COUNT];
 
 static uint32_t GimbalApp_GetNowMs(void);
 static void GimbalApp_LoadDefaultParams(GimbalAppParams *params);
@@ -108,6 +116,11 @@ static void GimbalApp_WriteLe16(uint8_t *dst, uint16_t value);
 static void GimbalApp_WriteLe32(uint8_t *dst, uint32_t value);
 static int16_t GimbalApp_ReadLe16s(const uint8_t *src);
 static uint16_t GimbalApp_AbsI16(int16_t value);
+static float GimbalApp_ParamMilliToFloat(uint32_t value_milli);
+static int16_t GimbalApp_FloatToI16(float value);
+static void GimbalApp_ResetKalmanFilters(void);
+static bool GimbalApp_DidKalmanConfigChange(const GimbalAppParams *lhs, const GimbalAppParams *rhs);
+static int16_t GimbalApp_ApplyKalman(uint8_t axis_index, int16_t measurement);
 static void GimbalApp_ConfigureServoTimer(void);
 static void GimbalApp_ProcessQueuedRx(void);
 static bool GimbalApp_RxFifoPush(uint8_t byte);
@@ -118,6 +131,7 @@ static bool GimbalApp_IsAxisParam(uint8_t param_id);
 void GimbalApp_Init(void)
 {
     memset(&g_gimbal, 0, sizeof(g_gimbal));
+    memset(g_kalman, 0, sizeof(g_kalman));
 
     GimbalApp_ConfigureServoTimer();
     GimbalApp_LoadDefaultParams(&g_gimbal.params);
@@ -640,6 +654,7 @@ static void GimbalApp_LoadDefaultParams(GimbalAppParams *params)
     params->axis[GIMBAL_APP_AXIS_PAN].min_us = 500U;
     params->axis[GIMBAL_APP_AXIS_PAN].max_us = 2500U;
     params->axis[GIMBAL_APP_AXIS_PAN].invert = 0U;
+    params->axis[GIMBAL_APP_AXIS_PAN].kalman_enable = 1U;
 
     params->axis[GIMBAL_APP_AXIS_TILT].deadband = 4U;
     params->axis[GIMBAL_APP_AXIS_TILT].max_step_us = 20U;
@@ -650,10 +665,13 @@ static void GimbalApp_LoadDefaultParams(GimbalAppParams *params)
     params->axis[GIMBAL_APP_AXIS_TILT].min_us = 500U;
     params->axis[GIMBAL_APP_AXIS_TILT].max_us = 2500U;
     params->axis[GIMBAL_APP_AXIS_TILT].invert = 0U;
+    params->axis[GIMBAL_APP_AXIS_TILT].kalman_enable = 1U;
 
     params->status_period_ms = 100U;
     params->target_timeout_ms = 250U;
     params->boot_center_ms = 300U;
+    params->kalman_q_milli = 16000U;
+    params->kalman_r_milli = 64000U;
 }
 
 static void GimbalApp_SanitizeParams(GimbalAppParams *params)
@@ -699,11 +717,17 @@ static void GimbalApp_SanitizeParams(GimbalAppParams *params)
         axis->center_us = GimbalApp_ClampAxisUs(axis, axis->center_us);
         axis->home_us = GimbalApp_ClampAxisUs(axis, axis->home_us);
         axis->invert = (axis->invert != 0U) ? 1U : 0U;
+        axis->kalman_enable = (axis->kalman_enable != 0U) ? 1U : 0U;
     }
 
     if (params->target_timeout_ms == 0U)
     {
         params->target_timeout_ms = 1U;
+    }
+
+    if (params->kalman_r_milli == 0U)
+    {
+        params->kalman_r_milli = 1U;
     }
 }
 
@@ -856,10 +880,13 @@ static void GimbalApp_RequestStatus(void)
 static void GimbalApp_ClearTargetValidity(void)
 {
     g_gimbal.latest_track.valid = false;
+    GimbalApp_ResetKalmanFilters();
 }
 
 static bool GimbalApp_HandleTrackFrame(uint16_t frame_id, uint32_t capture_ts_ms, uint8_t flags, const uint8_t *payload, uint8_t payload_len)
 {
+    int16_t raw_err_x;
+    int16_t raw_err_y;
     uint32_t now_ms;
 
     if (payload_len != 4U)
@@ -868,17 +895,19 @@ static bool GimbalApp_HandleTrackFrame(uint16_t frame_id, uint32_t capture_ts_ms
     }
 
     now_ms = GimbalApp_GetNowMs();
+    raw_err_x = GimbalApp_ReadLe16s(&payload[0]);
+    raw_err_y = GimbalApp_ReadLe16s(&payload[2]);
 
     g_gimbal.latest_track.frame_id = frame_id;
     g_gimbal.latest_track.capture_ts_ms = capture_ts_ms;
     g_gimbal.latest_track.rx_tick_ms = now_ms;
-    g_gimbal.latest_track.err_x = GimbalApp_ReadLe16s(&payload[0]);
-    g_gimbal.latest_track.err_y = GimbalApp_ReadLe16s(&payload[2]);
     g_gimbal.latest_track.flags = flags;
     g_gimbal.target_was_seen = true;
 
     if ((flags & GIMBAL_APP_FLAG_TARGET_VALID) != 0U)
     {
+        g_gimbal.latest_track.err_x = GimbalApp_ApplyKalman(GIMBAL_APP_AXIS_PAN, raw_err_x);
+        g_gimbal.latest_track.err_y = GimbalApp_ApplyKalman(GIMBAL_APP_AXIS_TILT, raw_err_y);
         g_gimbal.latest_track.valid = true;
         if (g_gimbal.state != GIMBAL_APP_STATE_BOOT_CENTERING)
         {
@@ -887,6 +916,9 @@ static bool GimbalApp_HandleTrackFrame(uint16_t frame_id, uint32_t capture_ts_ms
     }
     else
     {
+        GimbalApp_ResetKalmanFilters();
+        g_gimbal.latest_track.err_x = raw_err_x;
+        g_gimbal.latest_track.err_y = raw_err_y;
         g_gimbal.latest_track.valid = false;
         if (g_gimbal.state != GIMBAL_APP_STATE_BOOT_CENTERING)
         {
@@ -900,6 +932,7 @@ static bool GimbalApp_HandleTrackFrame(uint16_t frame_id, uint32_t capture_ts_ms
 static void GimbalApp_HandleParamSet(uint8_t msg_type, uint16_t frame_id, const uint8_t *payload, uint8_t payload_len)
 {
     GimbalAppParams new_params;
+    bool kalman_config_changed;
     uint8_t detail[GIMBAL_APP_MAX_PAYLOAD_LEN - 2U];
     uint8_t offset = 0U;
     uint8_t index;
@@ -926,7 +959,13 @@ static void GimbalApp_HandleParamSet(uint8_t msg_type, uint16_t frame_id, const 
     }
 
     GimbalApp_SanitizeParams(&new_params);
+    kalman_config_changed = GimbalApp_DidKalmanConfigChange(&g_gimbal.params, &new_params);
     g_gimbal.params = new_params;
+
+    if (kalman_config_changed)
+    {
+        GimbalApp_ResetKalmanFilters();
+    }
 
     if ((g_gimbal.state == GIMBAL_APP_STATE_STANDBY) || (g_gimbal.state == GIMBAL_APP_STATE_BOOT_CENTERING))
     {
@@ -955,6 +994,11 @@ static void GimbalApp_HandleParamSet(uint8_t msg_type, uint16_t frame_id, const 
             axis_start = 0U;
             axis_end = GIMBAL_APP_AXIS_COUNT;
         }
+        else if ((!GimbalApp_IsAxisParam(param_id)) && (axis_id == GIMBAL_APP_AXIS_ALL))
+        {
+            axis_start = 0U;
+            axis_end = 1U;
+        }
         else
         {
             axis_start = axis_id;
@@ -964,7 +1008,7 @@ static void GimbalApp_HandleParamSet(uint8_t msg_type, uint16_t frame_id, const 
         for (; axis_start < axis_end; ++axis_start)
         {
             int32_t applied_value;
-            uint8_t record_axis = GimbalApp_IsAxisParam(param_id) ? axis_start : axis_id;
+            uint8_t record_axis = GimbalApp_IsAxisParam(param_id) ? axis_start : GIMBAL_APP_AXIS_ALL;
 
             if (!GimbalApp_TryReadParam(&g_gimbal.params, param_id, record_axis, &applied_value))
             {
@@ -1003,6 +1047,7 @@ static void GimbalApp_HandleParamGet(uint8_t msg_type, uint16_t frame_id, const 
         { GIMBAL_APP_PARAM_MIN_US, GIMBAL_APP_AXIS_PAN },
         { GIMBAL_APP_PARAM_MAX_US, GIMBAL_APP_AXIS_PAN },
         { GIMBAL_APP_PARAM_INVERT, GIMBAL_APP_AXIS_PAN },
+        { GIMBAL_APP_PARAM_KALMAN_ENABLE, GIMBAL_APP_AXIS_PAN },
         { GIMBAL_APP_PARAM_DEADBAND, GIMBAL_APP_AXIS_TILT },
         { GIMBAL_APP_PARAM_MAX_STEP_US, GIMBAL_APP_AXIS_TILT },
         { GIMBAL_APP_PARAM_KP_NUM, GIMBAL_APP_AXIS_TILT },
@@ -1012,9 +1057,12 @@ static void GimbalApp_HandleParamGet(uint8_t msg_type, uint16_t frame_id, const 
         { GIMBAL_APP_PARAM_MIN_US, GIMBAL_APP_AXIS_TILT },
         { GIMBAL_APP_PARAM_MAX_US, GIMBAL_APP_AXIS_TILT },
         { GIMBAL_APP_PARAM_INVERT, GIMBAL_APP_AXIS_TILT },
+        { GIMBAL_APP_PARAM_KALMAN_ENABLE, GIMBAL_APP_AXIS_TILT },
         { GIMBAL_APP_PARAM_STATUS_PERIOD_MS, GIMBAL_APP_AXIS_ALL },
         { GIMBAL_APP_PARAM_TARGET_TIMEOUT_MS, GIMBAL_APP_AXIS_ALL },
-        { GIMBAL_APP_PARAM_BOOT_CENTER_MS, GIMBAL_APP_AXIS_ALL }
+        { GIMBAL_APP_PARAM_BOOT_CENTER_MS, GIMBAL_APP_AXIS_ALL },
+        { GIMBAL_APP_PARAM_KALMAN_Q_MILLI, GIMBAL_APP_AXIS_ALL },
+        { GIMBAL_APP_PARAM_KALMAN_R_MILLI, GIMBAL_APP_AXIS_ALL }
     };
 
     if ((payload_len % 2U) != 0U)
@@ -1299,7 +1347,9 @@ static bool GimbalApp_TrySetParam(GimbalAppParams *params, uint8_t param_id, uin
     if ((axis_id == GIMBAL_APP_AXIS_ALL) &&
         (param_id != GIMBAL_APP_PARAM_STATUS_PERIOD_MS) &&
         (param_id != GIMBAL_APP_PARAM_TARGET_TIMEOUT_MS) &&
-        (param_id != GIMBAL_APP_PARAM_BOOT_CENTER_MS))
+        (param_id != GIMBAL_APP_PARAM_BOOT_CENTER_MS) &&
+        (param_id != GIMBAL_APP_PARAM_KALMAN_Q_MILLI) &&
+        (param_id != GIMBAL_APP_PARAM_KALMAN_R_MILLI))
     {
         axis_start = 0U;
         axis_end = GIMBAL_APP_AXIS_COUNT;
@@ -1326,6 +1376,7 @@ static bool GimbalApp_TrySetParam(GimbalAppParams *params, uint8_t param_id, uin
     case GIMBAL_APP_PARAM_MIN_US:
     case GIMBAL_APP_PARAM_MAX_US:
     case GIMBAL_APP_PARAM_INVERT:
+    case GIMBAL_APP_PARAM_KALMAN_ENABLE:
         if (axis_end == axis_start)
         {
             return false;
@@ -1354,6 +1405,22 @@ static bool GimbalApp_TrySetParam(GimbalAppParams *params, uint8_t param_id, uin
             return false;
         }
         params->boot_center_ms = (uint32_t)value;
+        return true;
+
+    case GIMBAL_APP_PARAM_KALMAN_Q_MILLI:
+        if (value < 0)
+        {
+            return false;
+        }
+        params->kalman_q_milli = (uint32_t)value;
+        return true;
+
+    case GIMBAL_APP_PARAM_KALMAN_R_MILLI:
+        if (value <= 0)
+        {
+            return false;
+        }
+        params->kalman_r_milli = (uint32_t)value;
         return true;
 
     default:
@@ -1442,6 +1509,14 @@ static bool GimbalApp_TrySetParam(GimbalAppParams *params, uint8_t param_id, uin
             axis->invert = (uint8_t)value;
             break;
 
+        case GIMBAL_APP_PARAM_KALMAN_ENABLE:
+            if ((value != 0) && (value != 1))
+            {
+                return false;
+            }
+            axis->kalman_enable = (uint8_t)value;
+            break;
+
         default:
             return false;
         }
@@ -1471,6 +1546,14 @@ static bool GimbalApp_TryReadParam(const GimbalAppParams *params, uint8_t param_
 
     case GIMBAL_APP_PARAM_BOOT_CENTER_MS:
         *value_out = (int32_t)params->boot_center_ms;
+        return true;
+
+    case GIMBAL_APP_PARAM_KALMAN_Q_MILLI:
+        *value_out = (int32_t)params->kalman_q_milli;
+        return true;
+
+    case GIMBAL_APP_PARAM_KALMAN_R_MILLI:
+        *value_out = (int32_t)params->kalman_r_milli;
         return true;
 
     default:
@@ -1522,6 +1605,10 @@ static bool GimbalApp_TryReadParam(const GimbalAppParams *params, uint8_t param_
         *value_out = axis->invert;
         return true;
 
+    case GIMBAL_APP_PARAM_KALMAN_ENABLE:
+        *value_out = axis->kalman_enable;
+        return true;
+
     default:
         return false;
     }
@@ -1571,6 +1658,106 @@ static int16_t GimbalApp_ReadLe16s(const uint8_t *src)
 static uint16_t GimbalApp_AbsI16(int16_t value)
 {
     return (uint16_t)((value < 0) ? -value : value);
+}
+
+static float GimbalApp_ParamMilliToFloat(uint32_t value_milli)
+{
+    return ((float)value_milli) / 1000.0f;
+}
+
+static int16_t GimbalApp_FloatToI16(float value)
+{
+    int32_t rounded;
+
+    if (value >= 0.0f)
+    {
+        rounded = (int32_t)(value + 0.5f);
+    }
+    else
+    {
+        rounded = (int32_t)(value - 0.5f);
+    }
+
+    if (rounded > 32767)
+    {
+        return 32767;
+    }
+
+    if (rounded < -32768)
+    {
+        return -32768;
+    }
+
+    return (int16_t)rounded;
+}
+
+static void GimbalApp_ResetKalmanFilters(void)
+{
+    memset(g_kalman, 0, sizeof(g_kalman));
+}
+
+static bool GimbalApp_DidKalmanConfigChange(const GimbalAppParams *lhs, const GimbalAppParams *rhs)
+{
+    uint8_t axis_index;
+
+    if ((lhs == NULL) || (rhs == NULL))
+    {
+        return false;
+    }
+
+    if ((lhs->kalman_q_milli != rhs->kalman_q_milli) ||
+        (lhs->kalman_r_milli != rhs->kalman_r_milli))
+    {
+        return true;
+    }
+
+    for (axis_index = 0U; axis_index < GIMBAL_APP_AXIS_COUNT; ++axis_index)
+    {
+        if (lhs->axis[axis_index].kalman_enable != rhs->axis[axis_index].kalman_enable)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static int16_t GimbalApp_ApplyKalman(uint8_t axis_index, int16_t measurement)
+{
+    GimbalAxisKalmanState *axis_state;
+    float measurement_value;
+    float predicted_covariance;
+    float kalman_gain;
+    float r_value;
+
+    if (axis_index >= GIMBAL_APP_AXIS_COUNT)
+    {
+        return measurement;
+    }
+
+    if (g_gimbal.params.axis[axis_index].kalman_enable == 0U)
+    {
+        return measurement;
+    }
+
+    axis_state = &g_kalman[axis_index];
+    measurement_value = (float)measurement;
+    r_value = GimbalApp_ParamMilliToFloat(g_gimbal.params.kalman_r_milli);
+
+    if (!axis_state->initialized)
+    {
+        axis_state->initialized = true;
+        axis_state->estimate = measurement_value;
+        axis_state->covariance = r_value;
+        return measurement;
+    }
+
+    predicted_covariance = axis_state->covariance + GimbalApp_ParamMilliToFloat(g_gimbal.params.kalman_q_milli);
+    kalman_gain = predicted_covariance / (predicted_covariance + r_value);
+    axis_state->estimate += kalman_gain * (measurement_value - axis_state->estimate);
+    axis_state->covariance = (1.0f - kalman_gain) * predicted_covariance;
+
+    return GimbalApp_FloatToI16(axis_state->estimate);
 }
 
 static void GimbalApp_ProcessQueuedRx(void)
@@ -1654,6 +1841,7 @@ static bool GimbalApp_IsAxisParam(uint8_t param_id)
     case GIMBAL_APP_PARAM_MIN_US:
     case GIMBAL_APP_PARAM_MAX_US:
     case GIMBAL_APP_PARAM_INVERT:
+    case GIMBAL_APP_PARAM_KALMAN_ENABLE:
         return true;
 
     default:

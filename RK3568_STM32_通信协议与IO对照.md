@@ -9,12 +9,12 @@
 - `USART1` 是独立调试串口，只用于日志，不承载 RK3568 业务协议。
 - 当前已实现：
   - 跟踪误差输入
+  - 双轴一维 Kalman 观测滤波
   - 参数在线读写
   - 控制命令
   - 状态回传
   - ACK 应答
 - 当前未实现：
-  - Kalman 滤波
   - IMU 融合
   - 参数掉电保存
   - CRC16/CRC32
@@ -146,6 +146,7 @@ payload 固定 4 字节：
 行为：
 
 - `payload_len` 必须等于 `4`
+- 原始 `err_x / err_y` 在 STM32 侧先进入 Kalman 观测滤波，再进入控制器
 - `TARGET_VALID=1`：更新目标并切到 `TRACKING`
 - `TARGET_VALID=0`：目标无效，切到 `HOLD_LAST`
 - 如果请求了 `ACK_REQUEST`，合法帧回 `ACK OK`
@@ -173,6 +174,8 @@ payload 按 6 字节一组：
 - 所有参数先写入临时结构，全部合法后再整体提交
 - 提交后会执行参数整理和限幅
 - 成功时 ACK detail 返回“实际生效值”
+- 对全局参数，ACK detail 中的 `axis_id` 统一回 `0xFF`
+- 若修改了 `KALMAN_ENABLE / KALMAN_Q_MILLI / KALMAN_R_MILLI`，滤波内部状态会立即复位
 
 ### 6.3 PARAM_GET (`0x03`)
 
@@ -245,6 +248,9 @@ payload 固定 32 字节：
 说明：
 
 - `STATUS` 帧自己的 `frame_id` 是 STM32 自增发送序号，不等于最近一次 TRACK 的 `frame_id`
+- `last_err_x / last_err_y` 表示 STM32 当前用于控制的最近误差
+  - 对应轴 `KALMAN_ENABLE=1` 时，这里是滤波后的误差
+  - 对应轴 `KALMAN_ENABLE=0` 时，这里是原始误差
 
 ### 6.6 ACK (`0x82`)
 
@@ -299,6 +305,11 @@ payload：
 - `TRACKING -> HOLD_LAST`：目标超时
 - `任意 -> STANDBY`：`GO_HOME` / `SET_STANDBY` / `SET_STATE(STANDBY)`
 - `任意 -> HOLD_LAST`：`SET_HOLD_LAST` / `CLEAR_TARGET` / `SET_STATE(HOLD_LAST)`
+- 以下情况会复位 Kalman 内部状态：
+  - 收到 `TARGET_VALID=0` 的 TRACK
+  - `TRACKING` 状态下目标超时
+  - `GO_HOME` / `SET_STANDBY` / `CLEAR_TARGET` / `SET_STATE(STANDBY)`
+  - 在线修改 `KALMAN_ENABLE / KALMAN_Q_MILLI / KALMAN_R_MILLI`
 
 ## 8. 控制算法
 
@@ -307,6 +318,11 @@ payload：
 - 输入：
   - Pan 使用 `err_x`
   - Tilt 使用 `err_y`
+- 观测滤波：
+  - `TRACK` 有效帧到达时，先对每轴误差做一维标量 Kalman 滤波
+  - 当前使用随机游走模型：`P_pred = P_prev + Q`，`K = P_pred / (P_pred + R)`
+  - `KALMAN_ENABLE=0` 时，该轴直接旁路原始误差
+  - `Q / R` 通过 `PARAM_SET` 在线调整，内部按 `value / 1000.0` 解释为浮点量
 - 死区：
   - `abs(err) <= deadband` 时按 `0` 处理
 - 增量：
@@ -334,6 +350,7 @@ payload：
 | `0x07` | `MIN_US` | `PAN/TILT/ALL` | 脉宽下限 |
 | `0x08` | `MAX_US` | `PAN/TILT/ALL` | 脉宽上限 |
 | `0x09` | `INVERT` | `PAN/TILT/ALL` | 0 正向，1 反向 |
+| `0x0A` | `KALMAN_ENABLE` | `PAN/TILT/ALL` | 0 旁路原始误差，1 启用该轴 Kalman 滤波 |
 
 ### 9.2 全局参数
 
@@ -342,6 +359,8 @@ payload：
 | `0x20` | `STATUS_PERIOD_MS` | `0xFF` | 周期状态上报间隔 |
 | `0x21` | `TARGET_TIMEOUT_MS` | `0xFF` | 目标超时阈值 |
 | `0x22` | `BOOT_CENTER_MS` | `0xFF` | 上电归中保持时间 |
+| `0x23` | `KALMAN_Q_MILLI` | `0xFF` | Kalman 过程噪声参数，内部按 `value / 1000.0` 使用 |
+| `0x24` | `KALMAN_R_MILLI` | `0xFF` | Kalman 观测噪声参数，内部按 `value / 1000.0` 使用 |
 
 ### 9.3 axis_id
 
@@ -364,12 +383,15 @@ payload：
 | `min_us` | 500 | 500 |
 | `max_us` | 2500 | 2500 |
 | `invert` | 0 | 0 |
+| `kalman_enable` | 1 | 1 |
 
 全局默认值：
 
 - `status_period_ms = 100`
 - `target_timeout_ms = 250`
 - `boot_center_ms = 300`
+- `kalman_q_milli = 16000`
+- `kalman_r_milli = 64000`
 
 ### 9.5 参数整理规则
 
@@ -380,6 +402,9 @@ payload：
 - `max_step_us == 0` 时自动修正为 `1`
 - `center_us` 和 `home_us` 最终按 `min_us/max_us` 再限幅
 - `invert` 只允许 `0/1`
+- `kalman_enable` 只允许 `0/1`
+- `kalman_q_milli` 允许 `0` 及以上
+- `kalman_r_milli` 最小为 `1`
 - 当前默认机械定义：
   - 水平轴 `PAN.home_us = 1500 us` 保持不变
   - 竖直轴 `TILT.home_us = 501 us` 定义为“正前方回中”
@@ -398,6 +423,10 @@ payload：
 - 当前 ACK 队列长度为 `8`，若短时间大量需要 ACK 的请求同时涌入，可能触发 `ACK_OVERFLOW`。
 - 如果机械方向与协议正负号相反，优先通过 `INVERT` 参数修正，不建议改协议定义。
 - 若要强制切入 `TRACKING`，必须先有一帧合法且 `TARGET_VALID=1` 的 TRACK。
+- 调 `KALMAN_Q_MILLI` 时：
+  - 数值越大，误差跟随越快，平滑性越弱
+- 调 `KALMAN_R_MILLI` 时：
+  - 数值越大，误差更平滑，但响应更慢
 
 ## 11. 推荐联调顺序
 
@@ -406,7 +435,9 @@ payload：
 3. 校验 `STATUS` 中的当前状态、输出脉宽和参数
 4. 发送一帧 `TARGET_VALID=1` 的 TRACK，观察是否进入 `TRACKING`
 5. 再发送 `TARGET_VALID=0` 的 TRACK，观察是否进入 `HOLD_LAST`
-6. 用 `PARAM_GET` / `PARAM_SET` 调 `kp`、`deadband`、`max_step_us`
+6. 用 `PARAM_GET` 读取 `KALMAN_ENABLE / KALMAN_Q_MILLI / KALMAN_R_MILLI`
+7. 用 `PARAM_SET` 调 `kp`、`deadband`、`max_step_us`、`KALMAN_Q_MILLI / KALMAN_R_MILLI`
+8. 解析 `ACK.detail`，确认返回值已经生效
 
 ## 12. 建议的 TRACK 误差定义
 

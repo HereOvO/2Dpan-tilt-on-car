@@ -41,9 +41,14 @@
   - 死区
   - 最大单步变化
   - 比例参数
+  - Kalman 滤波开关
+  - Kalman Q/R 参数
   - 回中位
   - 舵机限位
   - 方向反转
+- 双轴一维 Kalman 观测滤波
+  - 在 `TRACK` 有效帧进入控制器前执行
+  - `TARGET_INVALID`、目标超时、回中类命令和滤波参数变更时自动复位
 - 调试串口日志输出
   - 使用 `USART1`
 - 联调脚本
@@ -51,7 +56,6 @@
 
 当前未实现或暂未启用的内容：
 
-- 卡尔曼滤波
 - IMU 融合
 - 参数掉电保存
 - 更强校验方式（如 CRC16/CRC32）
@@ -174,6 +178,7 @@
 - 小端字节序
 - 异或校验
 - 支持字节流拆包，不依赖 USB 一次回调等于一整帧
+- `PARAM_SET / PARAM_GET` 支持在线调试 Kalman 参数，成功后立即生效
 
 帧格式：
 
@@ -261,12 +266,15 @@ D:\Keil_v5\UV4\UV4.exe -b D:\projects_D\code\嵌赛\2Dpan-tilt\MDK-ARM\2Dpan-til
 2. 发送 `CONTROL_CMD(FORCE_STATUS)`
 3. 读取一帧 `STATUS`
 4. 确认当前状态为 `STANDBY`
-5. 发送 `TRACK(valid=1)`
-6. 观察是否进入 `TRACKING`
-7. 丢目标时发送 `TRACK(valid=0)`
-8. 观察是否进入 `HOLD_LAST`
-9. 发送 `GO_HOME`
-10. 观察是否回到 `STANDBY`
+5. 发送一次 `PARAM_GET(all)`，确认当前 `KALMAN_ENABLE / KALMAN_Q_MILLI / KALMAN_R_MILLI`
+6. 如需调试滤波手感，发送 `PARAM_SET`
+7. 解析 `ACK.detail`，确认返回的是实际生效值
+8. 发送 `TRACK(valid=1)`
+9. 观察是否进入 `TRACKING`
+10. 丢目标时发送 `TRACK(valid=0)`
+11. 观察是否进入 `HOLD_LAST`
+12. 发送 `GO_HOME`
+13. 观察是否回到 `STANDBY`
 
 ## 9. 当前默认控制参数
 
@@ -283,12 +291,15 @@ D:\Keil_v5\UV4\UV4.exe -b D:\projects_D\code\嵌赛\2Dpan-tilt\MDK-ARM\2Dpan-til
 | `min_us` | 500 | 500 |
 | `max_us` | 2500 | 2500 |
 | `invert` | 0 | 0 |
+| `kalman_enable` | 1 | 1 |
 
 全局参数默认值：
 
 - `status_period_ms = 100`
 - `target_timeout_ms = 250`
 - `boot_center_ms = 300`
+- `kalman_q_milli = 16000`
+- `kalman_r_milli = 64000`
 
 ## 10. 调试方法
 
@@ -320,6 +331,8 @@ powershell -ExecutionPolicy Bypass -File .\tools\serial_integration_test.ps1 -De
 
 - `COM19` 和 `COM18` 只是示例
 - 实际端口号请根据本机枚举结果修改
+- 脚本当前会解析 `ACK.detail` 中的参数记录，并验证 `PARAM_SET -> PARAM_GET` 回读
+- 默认覆盖 `DEADBAND` 与 `KALMAN_Q_MILLI` 两组在线参数测试
 
 ## 11. 文档说明
 
@@ -372,7 +385,6 @@ powershell -ExecutionPolicy Bypass -File .\tools\serial_integration_test.ps1 -De
 
 1. 完成 `RK3568` 上位机正式程序
 2. 做 `HOME_US / MIN_US / MAX_US / INVERT` 的机械标定
-3. 完成双舵机跟随参数整定
-4. 再评估是否引入滤波或预测
+3. 完成双舵机跟随与 `Kalman Q/R` 参数整定
+4. 评估是否需要在 RK3568 侧加预测补偿或更高阶滤波
 5. 最后再考虑 IMU 融合
-
